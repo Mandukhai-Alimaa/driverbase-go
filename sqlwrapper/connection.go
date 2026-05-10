@@ -48,6 +48,9 @@ type ConnectionImplBase struct {
 	Db *sql.DB
 
 	Pending io.Closer
+
+	// tx is the active transaction when autocommit is disabled, nil otherwise.
+	tx *sql.Tx
 }
 
 // newConnection creates a new ADBC Connection by acquiring a *sql.Conn from the pool.
@@ -64,7 +67,7 @@ func newConnection(ctx context.Context, db *databaseImpl) (adbc.ConnectionWithCo
 	// Create the base sqlwrapper connection first
 	sqlwrapperConn := &ConnectionImplBase{
 		ConnectionImplBase: base,
-		Conn:               &LoggingConn{Conn: sqlConn, Logger: base.Logger},
+		Conn:               &LoggingConn{Conn: sqlConn, Logger: base.Logger, exec: sqlConn},
 		TypeConverter:      db.typeConverter,
 		Db:                 db.db,
 	}
@@ -129,30 +132,94 @@ func (c *ConnectionImplBase) GetOption(ctx context.Context, key string) (string,
 	return c.ConnectionImplBase.GetOption(ctx, key)
 }
 
-// Commit is a no-op under auto-commit mode
-// TODO (https://github.com/adbc-drivers/driverbase-go/issues/28): we'll likely want to utilize https://pkg.go.dev/database/sql#Tx
-// to manage this here
+// SetAutocommit implements driverbase.AutocommitSetter.
+func (c *ConnectionImplBase) SetAutocommit(ctx context.Context, enabled bool) error {
+	if !enabled {
+		if c.tx != nil {
+			return nil // already in transaction
+		}
+		if err := c.ClearPending(); err != nil {
+			return err
+		}
+		return c.beginTx(ctx)
+	}
+	// Returning to autocommit: commit active transaction
+	if c.tx != nil {
+		if err := c.ClearPending(); err != nil {
+			return err
+		}
+		err := c.tx.Commit()
+		c.tx = nil
+		c.Conn.exec = c.Conn.Conn
+		if err != nil {
+			return c.Base().ErrorHelper.WrapIO(err, "failed to commit on autocommit enable")
+		}
+	}
+	return nil
+}
+
+func (c *ConnectionImplBase) beginTx(ctx context.Context) error {
+	tx, err := c.Conn.Conn.BeginTx(ctx, nil)
+	if err != nil {
+		return c.Base().ErrorHelper.WrapIO(err, "failed to begin transaction")
+	}
+	c.tx = tx
+	c.Conn.exec = tx
+	return nil
+}
+
+// Commit commits the current transaction and begins a new one (ADBC semantics).
 func (c *ConnectionImplBase) Commit(ctx context.Context) error {
-	return c.Base().ErrorHelper.Errorf(
-		adbc.StatusNotImplemented,
-		"Commit not supported in auto-commit mode",
-	)
+	if c.tx == nil {
+		return c.Base().ErrorHelper.Errorf(adbc.StatusInvalidState, "no active transaction")
+	}
+	if err := c.ClearPending(); err != nil {
+		return err
+	}
+	if err := c.tx.Commit(); err != nil {
+		c.tx = nil
+		c.Conn.exec = c.Conn.Conn
+		return c.Base().ErrorHelper.WrapIO(err, "failed to commit transaction")
+	}
+	c.tx = nil
+	c.Conn.exec = c.Conn.Conn
+	// ADBC semantics: non-autocommit = always in a transaction
+	return c.beginTx(ctx)
 }
 
-// Rollback is a no-op under auto-commit mode
-// TODO (https://github.com/adbc-drivers/driverbase-go/issues/28): we'll likely want to utilize https://pkg.go.dev/database/sql#Tx
-// to manage this here
+// Rollback rolls back the current transaction and begins a new one (ADBC semantics).
 func (c *ConnectionImplBase) Rollback(ctx context.Context) error {
-	return c.Base().ErrorHelper.Errorf(
-		adbc.StatusNotImplemented,
-		"Rollback not supported in auto-commit mode",
-	)
+	if c.tx == nil {
+		return c.Base().ErrorHelper.Errorf(adbc.StatusInvalidState, "no active transaction")
+	}
+	if err := c.ClearPending(); err != nil {
+		return err
+	}
+	if err := c.tx.Rollback(); err != nil {
+		c.tx = nil
+		c.Conn.exec = c.Conn.Conn
+		return c.Base().ErrorHelper.WrapIO(err, "failed to rollback transaction")
+	}
+	c.tx = nil
+	c.Conn.exec = c.Conn.Conn
+	// ADBC semantics: non-autocommit = always in a transaction
+	return c.beginTx(ctx)
 }
 
-// Close closes the underlying SQL connection
+var _ driverbase.AutocommitSetter = (*ConnectionImplBase)(nil)
+
+// Close closes the underlying SQL connection, rolling back any active transaction.
 func (c *ConnectionImplBase) Close(ctx context.Context) error {
 	if err := c.ClearPending(); err != nil {
+		if c.tx != nil {
+			_ = c.tx.Rollback()
+			c.tx = nil
+		}
 		return errors.Join(err, c.Conn.Close())
+	}
+	if c.tx != nil {
+		_ = c.tx.Rollback()
+		c.tx = nil
 	}
 	return c.Conn.Close()
 }

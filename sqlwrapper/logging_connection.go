@@ -30,22 +30,23 @@ import (
 type LoggingConn struct {
 	Conn   *sql.Conn
 	Logger *slog.Logger
+	exec   sqlExecutor
 }
 
 func (tc *LoggingConn) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
-	return tc.Conn.ExecContext(ctx, query, args...)
+	return tc.exec.ExecContext(ctx, query, args...)
 }
 
 func (tc *LoggingConn) QueryContext(ctx context.Context, query string, args ...any) (*LoggingRows, error) {
-	rows, err := tc.Conn.QueryContext(ctx, query, args...)
+	rows, err := tc.exec.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
-	return &LoggingRows{Rows: rows, Logger: tc.Logger}, err
+	return &LoggingRows{Rows: rows, Logger: tc.Logger}, nil
 }
 
 func (tc *LoggingConn) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
-	return tc.Conn.QueryRowContext(ctx, query, args...)
+	return tc.exec.QueryRowContext(ctx, query, args...)
 }
 
 func (tc *LoggingConn) PingContext(ctx context.Context) error {
@@ -53,7 +54,7 @@ func (tc *LoggingConn) PingContext(ctx context.Context) error {
 }
 
 func (tc *LoggingConn) PrepareContext(ctx context.Context, query string) (*LoggingStmt, error) {
-	stmt, err := tc.Conn.PrepareContext(ctx, query)
+	stmt, err := tc.exec.PrepareContext(ctx, query)
 	if err != nil {
 		return nil, err
 	}
